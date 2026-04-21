@@ -1,0 +1,21 @@
+# AppDaemon app configuration for Daily Todo Generator v6
+# Deploy this file to: /addon_configs/a0d7b954_appdaemon/apps/apps.yaml
+# Deploy daily_todo_generator.py to: /addon_configs/a0d7b954_appdaemon/apps/daily_todo_generator.py
+
+daily_todo:
+  module: daily_todo_generator
+  class: DailyTodoGenerator
+
+  # ── API Keys ─────────────────────────────────────────────────────────────────
+  notion_api_key: !secret notion_api_key
+  claude_api_key: !secret claude_api_key
+  claude_model:   claude-opus-4-6   # optional — this is the default
+
+  # ── Notion Page / Database IDs ───────────────────────────────────────────────
+  journal_root_id:    "29ac0a841dad806d87eeec2eb13ea9bc"   # Daily Journal root page
+  caretaking_page_id: "18ec0a841dad80368b59cbf1eadf280d"   # Caretaking Tables page
+  quick_task_db_id:   "fbf8b23d4ed74ba0bc73991baae428b6"   # Quick Tasks database (Priority: High/Medium/Low/Backlog)
+  project_dump_db_id: "18ec0a841dad80f180f6c281314eb454"   # Project Dump database
+
+  # ── Home Assistant Entity IDs ────────────────────────────────────────────────
+  todo_entity: todo.daily_schedule     # HA todo list to write the daily schedule to
