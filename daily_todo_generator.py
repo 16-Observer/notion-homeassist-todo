@@ -31,7 +31,10 @@ import hassapi as hass
 import requests
 import json
 import re
+import os
 from datetime import datetime, timedelta
+
+HA_API = "http://supervisor/core/api"
 
 NOTION_VERSION = "2022-06-28"
 CLAUDE_URL     = "https://api.anthropic.com/v1/messages"
@@ -268,21 +271,57 @@ class DailyTodoGenerator(hass.Hass):
             self.log("Error fetching projects: {}".format(e), level="WARNING")
             return "Could not read projects."
 
-    def get_incomplete_ha_items(self):
-        """Read the current HA todo list and return items that aren't completed.
-        Called BEFORE write_to_ha clears the list, so we capture yesterday's leftovers.
+    def _ha_token(self):
+        return os.environ.get("SUPERVISOR_TOKEN", "")
+
+    def _ha_headers(self):
+        return {
+            "Authorization": "Bearer {}".format(self._ha_token()),
+            "Content-Type": "application/json",
+        }
+
+    def _ha_get_todo_items(self):
+        """Fetch current todo items from HA via REST API.
+        Returns list of dicts with at least 'summary', 'uid', 'status' keys.
         """
+        r = requests.post(
+            "{}/services/todo/get_items".format(HA_API),
+            headers=self._ha_headers(),
+            json={"entity_id": self.todo_entity},
+            params={"return_response": "true"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        # HA 2023.4+: {"service_response": {"todo.entity": {"items": [...]}}}
+        if isinstance(data, dict) and "service_response" in data:
+            return data["service_response"].get(self.todo_entity, {}).get("items", [])
+        return []
+
+    def _ha_remove_todo_item(self, uid):
+        requests.post(
+            "{}/services/todo/remove_item".format(HA_API),
+            headers=self._ha_headers(),
+            json={"entity_id": self.todo_entity, "item": uid},
+            timeout=10,
+        ).raise_for_status()
+
+    def _ha_add_todo_item(self, summary):
+        requests.post(
+            "{}/services/todo/add_item".format(HA_API),
+            headers=self._ha_headers(),
+            json={"entity_id": self.todo_entity, "item": summary},
+            timeout=10,
+        ).raise_for_status()
+
+    def get_incomplete_ha_items(self):
+        """Return summaries of items not yet completed — called BEFORE we clear the list."""
         try:
-            result = self.call_service(
-                "todo/get_items",
-                entity_id=self.todo_entity,
-                return_response=True,
-            )
-            items = result.get(self.todo_entity, {}).get("items", [])
+            items = self._ha_get_todo_items()
             incomplete = [
                 item.get("summary", "")
                 for item in items
-                if item.get("status", "").lower() not in ("completed", "done")
+                if item.get("status", "needs_action") != "completed"
                 and item.get("summary", "")
             ]
             self.log("Found {} incomplete items from yesterday.".format(len(incomplete)))
@@ -613,27 +652,23 @@ SCHEDULE RULES:
     # ─── Output: HA Todo ──────────────────────────────────────────────────────
 
     def write_to_ha(self, response):
-        # Step 1: clear existing items (failure here does NOT block adding new ones)
+        # Step 1: clear existing items — if this fails, abort (no point adding on top of old list)
         try:
-            current = self.call_service(
-                "todo/get_items",
-                entity_id=self.todo_entity,
-                return_response=True,
-            )
-            for item in current.get(self.todo_entity, {}).get("items", []):
+            items = self._ha_get_todo_items()
+            removed = 0
+            for item in items:
+                uid = item.get("uid") or item.get("summary", "")
                 try:
-                    self.call_service(
-                        "todo/remove_item",
-                        entity_id=self.todo_entity,
-                        item=item.get("summary", ""),
-                    )
+                    self._ha_remove_todo_item(uid)
+                    removed += 1
                 except Exception as ex:
-                    self.log("Could not remove item: {}".format(ex), level="WARNING")
+                    self.log("Could not remove '{}': {}".format(uid, ex), level="WARNING")
+            self.log("Cleared {} items from {}.".format(removed, self.todo_entity))
         except Exception as e:
-            self.log("Could not clear todo list (continuing anyway): {}".format(e),
-                     level="WARNING")
+            self.log("Could not clear todo list — aborting write: {}".format(e), level="ERROR")
+            return
 
-        # Step 2: parse the schedule section and add items
+        # Step 2: parse the schedule section and add new items
         in_schedule   = False
         current_block = ""
         added         = 0
@@ -641,35 +676,27 @@ SCHEDULE RULES:
         for line in response.split("\n"):
             s = line.strip()
 
-            # Enter schedule section
             if "Daily Schedule" in s and s.startswith("## "):
                 in_schedule = True
                 continue
 
-            # Exit schedule section on next H2
             if in_schedule and s.startswith("## ") and "Daily Schedule" not in s:
                 break
 
             if not in_schedule:
                 continue
 
-            # Track current time block header
             if s.startswith("**") and s.endswith("**"):
                 current_block = s.strip("*").strip()
 
-            # Add checkbox items
             elif s.startswith("- [ ]"):
                 task_text = s[5:].strip()
                 item_text = "[{}] {}".format(current_block, task_text) if current_block else task_text
                 try:
-                    self.call_service(
-                        "todo/add_item",
-                        entity_id=self.todo_entity,
-                        item=item_text,
-                    )
+                    self._ha_add_todo_item(item_text)
                     added += 1
                 except Exception as ex:
-                    self.log("Failed to add todo: {}".format(ex), level="WARNING")
+                    self.log("Failed to add '{}': {}".format(item_text, ex), level="WARNING")
 
         self.log("Added {} items to {}.".format(added, self.todo_entity))
 
