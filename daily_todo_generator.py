@@ -1,31 +1,37 @@
-# Daily Todo Generator v6 - AppDaemon App
+# Daily Todo Generator v7 - AppDaemon App
 #
-# What's new vs v5:
+# What's new in v7:
+#   - NEW journal architecture: single persistent "📓 Today's Journal" page
+#       1. Read journal content from the fixed Today's Journal page
+#       2. Archive those blocks to the dated day page (year→month→day)
+#       3. Append the AI plan to that same dated archive page
+#       4. Clear Today's Journal so it's ready for a new day
+#   - User types into one page forever; script handles archiving automatically
+#
+# What was new in v6:
 #   - Proper Notion block rendering (heading_2, heading_3, to_do, bulleted_list_item)
 #   - HA todo: clear and add are independent — a clear failure no longer blocks adds
-#   - Quick Tasks: uses correct DB (349ea7b1...), correct field types (select not status),
+#   - Quick Tasks: uses correct DB, correct field types (select not status),
 #     correct priority order (Backlog→Low→Medium→High)
 #   - Quick Tasks: Claude-extracted tasks are added OR their priority is bumped if
 #     they already exist in the DB (no duplicates)
-#   - Calendar: no HA/Notion calendar DB available — Claude extracts date events from
-#     journal and writes them as a callout block in the day's Notion page
-#   - New prompt structure matching the original ChatGPT workflow:
-#       emotional state → stressors → learnings → therapy notes → ideas →
-#       extracted tasks → calendar events → schedule
+#   - Calendar: Claude extracts date events from journal and writes them as a
+#     callout block in the day's Notion page
 #   - Morning block simplified: only ADHD-critical items, max 5-6 total
 #   - Hard cap of 5-6 items per schedule block
 #
 # Install: /addon_configs/a0d7b954_appdaemon/apps/daily_todo_generator.py
 #
 # Required apps.yaml keys:
-#   notion_api_key:       !secret notion_api_key
-#   claude_api_key:       !secret claude_api_key
-#   claude_model:         claude-opus-4-6          (optional, default shown)
-#   journal_root_id:      <notion page id>
-#   caretaking_page_id:   <notion page id>
-#   quick_task_db_id:     <notion db id>  → use fbf8b23d4ed74ba0bc73991baae428b6
-#   project_dump_db_id:   <notion db id>
-#   todo_entity:          todo.daily_schedule       (optional, default shown)
+#   notion_api_key:          !secret notion_api_key
+#   claude_api_key:          !secret claude_api_key
+#   claude_model:            claude-opus-4-6          (optional, default shown)
+#   journal_root_id:         <notion page id>          (archive root — year/month/day hierarchy)
+#   todays_journal_page_id:  <notion page id>          → 362c0a841dad816d9ddbe961013eeb1c
+#   caretaking_page_id:      <notion page id>
+#   quick_task_db_id:        <notion db id>            → fbf8b23d4ed74ba0bc73991baae428b6
+#   project_dump_db_id:      <notion db id>
+#   todo_entity:             todo.daily_schedule       (optional, default shown)
 
 import hassapi as hass
 import requests
@@ -51,15 +57,16 @@ class DailyTodoGenerator(hass.Hass):
         self.claude_key      = self.args.get("claude_api_key")
         self.claude_model    = self.args.get("claude_model", "claude-opus-4-6")
 
-        self.journal_root_id    = self.args.get("journal_root_id")
-        self.caretaking_page_id = self.args.get("caretaking_page_id")
-        self.quick_task_db_id   = self.args.get("quick_task_db_id")
-        self.project_dump_db_id = self.args.get("project_dump_db_id")
-        self.todo_entity        = self.args.get("todo_entity", "todo.daily_schedule")
+        self.journal_root_id         = self.args.get("journal_root_id")
+        self.todays_journal_page_id  = self.args.get("todays_journal_page_id")
+        self.caretaking_page_id      = self.args.get("caretaking_page_id")
+        self.quick_task_db_id        = self.args.get("quick_task_db_id")
+        self.project_dump_db_id      = self.args.get("project_dump_db_id")
+        self.todo_entity             = self.args.get("todo_entity", "todo.daily_schedule")
 
         self.run_daily(self.generate_todo, "01:00:00")
         self.listen_event(self.manual_trigger, "generate_daily_todo")
-        self.log("Daily Todo Generator v6 initialized.")
+        self.log("Daily Todo Generator v7 initialized.")
 
     # ─── Entry points ────────────────────────────────────────────────────────
 
@@ -71,16 +78,17 @@ class DailyTodoGenerator(hass.Hass):
         self.log("Starting daily todo generation...")
         try:
             now         = datetime.now()
-            yesterday   = now - timedelta(days=1)   # journal to read
-            target_date = now                        # day we are planning for
+            target_date = now   # plan is written for today
 
-            # Capture incomplete items BEFORE write_to_ha clears the list
+            # Before clearing the HA list: capture incomplete items AND mark completed Quick Tasks
+            quick_tasks      = self.get_quick_tasks()
             incomplete_items = self.get_incomplete_ha_items()
+            self.mark_completed_quick_tasks(quick_tasks)
 
-            journal_text    = self.get_journal(yesterday)
+            # Read from the persistent "Today's Journal" page (v7)
+            journal_text, raw_journal_blocks = self.get_journal()
             caretaking_text = self.get_caretaking_tasks()
-            quick_tasks     = self.get_quick_tasks()   # list of dicts
-            project_tasks   = self.get_project_tasks() # plain text
+            project_tasks   = self.get_project_tasks()
 
             prompt   = self.build_prompt(target_date, journal_text, caretaking_text,
                                          quick_tasks, project_tasks, incomplete_items)
@@ -89,11 +97,17 @@ class DailyTodoGenerator(hass.Hass):
                 self.log("Claude returned empty response.", level="WARNING")
                 return
 
-            day_page_id = self.write_to_notion(response, target_date)
+            # Archive journal to dated page, append AI plan, then clear Today's Journal
+            day_page_id = self.archive_and_write_to_notion(
+                response, target_date, raw_journal_blocks
+            )
             self.write_to_ha(response)
             self.upsert_quick_tasks(response, quick_tasks)
             self.apply_quick_tasks_triage(response, quick_tasks)
             self.write_calendar_events_to_notion(response, day_page_id)
+
+            # Clear the journal LAST — only after everything else succeeded
+            self.clear_todays_journal()
 
             self.log("Daily todo generation complete.")
             self.fire_event("daily_todo_generated", date=target_date.strftime("%m/%d"))
@@ -175,29 +189,26 @@ class DailyTodoGenerator(hass.Hass):
                     return b["id"]
         return None
 
-    def get_journal(self, date):
+    def get_journal(self):
+        """Read content from the persistent 'Today's Journal' page.
+        Returns (text: str, raw_blocks: list) — the text for Claude, and the raw
+        Notion block objects so we can copy them verbatim to the archive page.
+        """
         try:
-            year_str  = date.strftime("%Y")
-            month_str = date.strftime("%B %Y")
-            day_str   = date.strftime("%m/%d")
+            if not self.todays_journal_page_id:
+                self.log("todays_journal_page_id not configured.", level="WARNING")
+                return "No journal page configured.", []
 
-            year_id = self.find_child_page(self.journal_root_id, year_str)
-            if not year_id:
-                return "No journal year page found for {}.".format(year_str)
+            blocks = self.n_get(
+                "blocks/{}/children".format(self.todays_journal_page_id)
+            ).get("results", [])
 
-            month_id = self.find_child_page(year_id, month_str)
-            if not month_id:
-                return "No journal month page found for {}.".format(month_str)
-
-            day_id = self.find_child_page(month_id, day_str)
-            if not day_id:
-                return "No journal entry found for {}.".format(day_str)
-
-            blocks = self.n_get("blocks/{}/children".format(day_id)).get("results", [])
-            return self.extract_text(blocks) or "Journal page was empty."
+            text = self.extract_text(blocks) or "Journal page was empty."
+            self.log("Read {} block(s) from Today's Journal.".format(len(blocks)))
+            return text, blocks
         except Exception as e:
             self.log("Error fetching journal: {}".format(e), level="WARNING")
-            return "Could not read journal."
+            return "Could not read journal.", []
 
     def get_caretaking_tasks(self):
         try:
@@ -330,6 +341,41 @@ class DailyTodoGenerator(hass.Hass):
             self.log("Could not read incomplete items: {}".format(e), level="WARNING")
             return []
 
+    def mark_completed_quick_tasks(self, existing_tasks):
+        """Cross-reference completed HA todo items against Quick Tasks DB and mark Done.
+        Strips the '[Block Name] ' prefix before matching.
+        """
+        try:
+            items = self._ha_get_todo_items()
+            completed_summaries = [
+                item.get("summary", "")
+                for item in items
+                if item.get("status") == "completed" and item.get("summary", "")
+            ]
+            if not completed_summaries:
+                return
+
+            # Build lookup: lowercase task name → record
+            existing = {t["task"].strip().lower(): t for t in existing_tasks}
+
+            for summary in completed_summaries:
+                # Strip the [Block Name] prefix the script adds
+                clean = re.sub(r"^\[.*?\]\s*", "", summary).strip().lower()
+                rec = existing.get(clean)
+                if not rec:
+                    # Try partial match on first 30 chars
+                    for key, val in existing.items():
+                        if clean and (key.startswith(clean[:30]) or clean.startswith(key[:30])):
+                            rec = val
+                            break
+                if rec and rec.get("priority") != "Done":
+                    self.n_patch("pages/{}".format(rec["id"]), {
+                        "properties": {"Status": {"select": {"name": "Done"}}}
+                    })
+                    self.log("Marked Done in Quick Tasks: '{}'".format(rec["task"]))
+        except Exception as e:
+            self.log("Error marking completed quick tasks: {}".format(e), level="WARNING")
+
     # ─── Prompt ───────────────────────────────────────────────────────────────
 
     def build_prompt(self, target_date, journal_text, caretaking_text,
@@ -351,13 +397,25 @@ class DailyTodoGenerator(hass.Hass):
         return """You are Austin's executive function assistant. Your job: analyze today's journal, triage what didn't get done, and produce a structured daily plan for tomorrow ({day_name}, {date_str}).
 
 CONTEXT ABOUT AUSTIN:
-- Has ADHD — tasks must be specific, broken into 5-15 min steps requiring zero decision-making.
+- Has ADHD — tasks must be specific and broken into concrete steps.
 - Runs a 9-acre homestead with ~40 chickens, geese, dogs, cats, and a large garden.
 - Goes by Grace sometimes, wears diapers — routine self-care, never list as a task.
 - Do NOT list "change diaper", "apply deodorant", or "get dressed" as tasks. These happen.
 - ADHD friction points to always catch: brush teeth, drink water, feed animals.
 - Morning block: SHORT. Only what ADHD makes easy to skip. 5-6 items MAX.
 - Each time block: 5-6 items MAX. Fewer meaningful tasks beat a wall of tiny ones.
+
+TASK FORMAT — THIS IS CRITICAL:
+- Each checkbox is the task name + one emoji. Nothing else.
+- NO coaching, commentary, instructions, time suggestions, or motivational text after the task.
+- NO dashes with explanations. NO "— sit down", "— no negotiating", "— 15 min timer".
+- BAD:  "- [ ] Run 5 miles 🏃 — shoes on, out the door, no negotiating. Priority."
+- GOOD: "- [ ] Run 5 miles 🏃"
+- BAD:  "- [ ] Eat lunch — warm food, sit down, full glass of water 🍽️"
+- GOOD: "- [ ] Eat lunch 🍽️"
+- BAD:  "- [ ] Dishes — 15 min timer, stop when it goes off"
+- GOOD: "- [ ] Wash dishes 🍽️"
+- If a task needs more context, break it into two separate checkboxes.
 
 QUICK TASK RULES (important):
 - Everything that needs tracking goes in Quick Tasks — even small, quick items — UNLESS it is a
@@ -612,8 +670,42 @@ SCHEDULE RULES:
         })
         return resp["id"]
 
-    def write_to_notion(self, response, target_date):
-        """Write AI plan to the day's journal page. Returns the page ID."""
+    def _blocks_to_children(self, raw_blocks):
+        """Convert raw Notion API block objects into minimal child-block dicts
+        suitable for appending via the blocks/children endpoint.
+        Only carries type + content — no id, created_time, etc.
+        """
+        allowed_types = {
+            "paragraph", "heading_1", "heading_2", "heading_3",
+            "bulleted_list_item", "numbered_list_item", "to_do",
+            "quote", "callout", "code", "divider", "toggle",
+        }
+        children = []
+        for b in raw_blocks:
+            bt = b.get("type")
+            if bt not in allowed_types:
+                continue
+            payload = b.get(bt, {})
+            child = {"object": "block", "type": bt, bt: {}}
+            # Copy rich_text if present
+            if "rich_text" in payload:
+                child[bt]["rich_text"] = payload["rich_text"]
+            # Copy checked for to_do
+            if bt == "to_do" and "checked" in payload:
+                child[bt]["checked"] = payload["checked"]
+            # Skip dividers (they have no content key)
+            if bt == "divider":
+                child = {"object": "block", "type": "divider", "divider": {}}
+            children.append(child)
+        return children
+
+    def archive_and_write_to_notion(self, response, target_date, raw_journal_blocks):
+        """
+        1. Create/find the dated archive page (year → month → day).
+        2. Copy the raw journal blocks to the archive page as "📓 Raw Journal".
+        3. Append the AI plan to the same page under "🗓️ AI Daily Plan".
+        Returns the day page ID (used downstream for calendar callout).
+        """
         try:
             year_str  = target_date.strftime("%Y")
             month_str = target_date.strftime("%B %Y")
@@ -623,7 +715,20 @@ SCHEDULE RULES:
             month_id = self.get_or_create_page(year_id, month_str)
             day_id   = self.get_or_create_page(month_id, day_str)
 
-            header_blocks = [
+            # ── Section 1: raw journal archive ────────────────────────────────
+            journal_header = [
+                {
+                    "object": "block",
+                    "type":   "heading_1",
+                    "heading_1": {
+                        "rich_text": [{"type": "text", "text": {"content": "📓 Raw Journal"}}]
+                    },
+                },
+            ]
+            journal_children = self._blocks_to_children(raw_journal_blocks)
+
+            # ── Section 2: AI plan ────────────────────────────────────────────
+            plan_header = [
                 {"object": "block", "type": "divider", "divider": {}},
                 {
                     "object": "block",
@@ -633,8 +738,9 @@ SCHEDULE RULES:
                     },
                 },
             ]
-            schedule_blocks = self.text_to_notion_blocks(response)
-            all_blocks      = header_blocks + schedule_blocks
+            plan_blocks = self.text_to_notion_blocks(response)
+
+            all_blocks = journal_header + journal_children + plan_header + plan_blocks
 
             # Notion API max 100 blocks per request
             for i in range(0, len(all_blocks), 100):
@@ -643,16 +749,44 @@ SCHEDULE RULES:
                     {"children": all_blocks[i : i + 100]},
                 )
 
-            self.log("Wrote schedule to Notion: {}".format(day_str))
+            self.log("Archived journal + AI plan to Notion: {}".format(day_str))
             return day_id
         except Exception as e:
             self.log("Error writing to Notion: {}".format(e), level="ERROR")
             return None
 
+    def clear_todays_journal(self):
+        """Delete all blocks from the persistent 'Today's Journal' page,
+        leaving it blank and ready for the next day's notes.
+        """
+        if not self.todays_journal_page_id:
+            return
+        try:
+            blocks = self.n_get(
+                "blocks/{}/children".format(self.todays_journal_page_id)
+            ).get("results", [])
+
+            deleted = 0
+            for block in blocks:
+                try:
+                    r = requests.delete(
+                        "{}/blocks/{}".format(NOTION_URL, block["id"]),
+                        headers=self.n_headers(),
+                    )
+                    r.raise_for_status()
+                    deleted += 1
+                except Exception as ex:
+                    self.log("Could not delete block {}: {}".format(block["id"], ex),
+                             level="WARNING")
+
+            self.log("Cleared {} block(s) from Today's Journal.".format(deleted))
+        except Exception as e:
+            self.log("Error clearing Today's Journal: {}".format(e), level="WARNING")
+
     # ─── Output: HA Todo ──────────────────────────────────────────────────────
 
     def write_to_ha(self, response):
-        # Step 1: clear existing items — if this fails, abort (no point adding on top of old list)
+        # Step 1: clear existing items — failure here does NOT block adding new ones
         try:
             items = self._ha_get_todo_items()
             removed = 0
@@ -665,8 +799,7 @@ SCHEDULE RULES:
                     self.log("Could not remove '{}': {}".format(uid, ex), level="WARNING")
             self.log("Cleared {} items from {}.".format(removed, self.todo_entity))
         except Exception as e:
-            self.log("Could not clear todo list — aborting write: {}".format(e), level="ERROR")
-            return
+            self.log("Could not clear todo list (continuing anyway): {}".format(e), level="WARNING")
 
         # Step 2: parse the schedule section and add new items
         in_schedule   = False
